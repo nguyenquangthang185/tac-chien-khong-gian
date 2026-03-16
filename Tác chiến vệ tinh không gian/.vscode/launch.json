@@ -1,0 +1,763 @@
+#include <GL/freeglut.h>
+#include <cmath>
+#include <vector>
+#include <string>
+#include <sstream>
+#include <cstdlib>
+#include <ctime>
+#include <algorithm>
+
+struct Vec2 {
+    float x, y;
+};
+
+struct Star {
+    float x, y;
+    float phase;
+    float twinkle;
+};
+
+struct TrailPoint {
+    Vec2 pos;
+    float life;
+};
+
+enum SatelliteType {
+    SAT_RECON = 0,
+    SAT_DEFENSE = 1,
+    SAT_COMMAND = 2
+};
+
+enum MissileType {
+    MISSILE_INTERCEPTOR = 0,
+    MISSILE_BALLISTIC = 1,
+    MISSILE_HUNTER = 2
+};
+
+enum GuidanceType {
+    GUIDE_DIRECT = 0,
+    GUIDE_PARABOLIC = 1,
+    GUIDE_HOMING = 2
+};
+
+struct SatelliteProfile {
+    std::string name;
+    std::string role;
+    float energy;
+    float lockRange;
+    float reloadTime;
+    float bodyScale;
+};
+
+struct MissileProfile {
+    std::string name;
+    std::string note;
+    float speed;
+    float turnRate;
+    float blastRadius;
+    GuidanceType guidance;
+    float gravity;
+};
+
+struct Target {
+    Vec2 pos;
+    Vec2 basePos;
+    float radius;
+    float phase;
+    float pulse;
+    bool destroyed = false;
+};
+
+struct Missile {
+    Vec2 pos;
+    Vec2 vel;
+    Vec2 startPos;
+    Vec2 targetSnapshot;
+    bool active = false;
+    float radius = 6.0f;
+    float age = 0.0f;
+    float life = 0.0f;
+    MissileType type = MISSILE_INTERCEPTOR;
+};
+
+struct Explosion {
+    Vec2 pos;
+    float radius = 0.0f;
+    bool active = false;
+    int life = 0;
+};
+
+const int WIDTH = 1280;
+const int HEIGHT = 760;
+const float PI = 3.1415926535f;
+
+std::vector<Star> stars;
+std::vector<Target> targets;
+std::vector<TrailPoint> trail;
+Missile missile;
+Explosion explosion;
+
+SatelliteType currentSatellite = SAT_RECON;
+MissileType currentMissile = MISSILE_INTERCEPTOR;
+int selectedTarget = -1;
+bool paused = false;
+int score = 0;
+float globalTimeSec = 0.0f;
+float radarSweepAngle = 0.0f;
+float cooldown = 0.0f;
+
+SatelliteProfile satProfiles[3] = {
+    {"RECON SAT",   "Trinh sat - khoa muc tieu nhanh", 100.0f, 1200.0f, 0.8f, 1.00f},
+    {"DEFENSE SAT", "Tac chien - can bang",            120.0f, 1000.0f, 1.2f, 1.15f},
+    {"COMMAND SAT", "Chi huy - nang luong cao",        150.0f, 1350.0f, 1.5f, 1.30f}
+};
+
+MissileProfile missileProfiles[3] = {
+    {"INTERCEPTOR", "Dan danh chan toc do cao",         7.8f, 0.06f, 22.0f, GUIDE_DIRECT,    0.00f},
+    {"BALLISTIC",   "Dan dao bay parabol",              7.0f, 0.00f, 32.0f, GUIDE_PARABOLIC, 0.055f},
+    {"HUNTER",      "Dan tu dan huong thong minh",      5.8f, 0.14f, 26.0f, GUIDE_HOMING,    0.00f}
+};
+
+float randFloat(float a, float b) {
+    return a + (b - a) * (float)std::rand() / (float)RAND_MAX;
+}
+
+float clampf(float v, float a, float b) {
+    return std::max(a, std::min(b, v));
+}
+
+float distance2D(const Vec2& a, const Vec2& b) {
+    float dx = a.x - b.x;
+    float dy = a.y - b.y;
+    return std::sqrt(dx * dx + dy * dy);
+}
+
+Vec2 normalize(const Vec2& v) {
+    float len = std::sqrt(v.x * v.x + v.y * v.y);
+    if (len < 0.0001f) return {0.0f, 0.0f};
+    return {v.x / len, v.y / len};
+}
+
+Vec2 operator+(const Vec2& a, const Vec2& b) { return {a.x + b.x, a.y + b.y}; }
+Vec2 operator-(const Vec2& a, const Vec2& b) { return {a.x - b.x, a.y - b.y}; }
+Vec2 operator*(const Vec2& a, float k) { return {a.x * k, a.y * k}; }
+
+void drawText(float x, float y, const std::string& text, void* font = GLUT_BITMAP_HELVETICA_18) {
+    glRasterPos2f(x, y);
+    for (char c : text) glutBitmapCharacter(font, c);
+}
+
+void drawCircle(float cx, float cy, float r, int segments = 48, bool filled = true) {
+    glBegin(filled ? GL_POLYGON : GL_LINE_LOOP);
+    for (int i = 0; i < segments; i++) {
+        float angle = 2.0f * PI * i / segments;
+        glVertex2f(cx + std::cos(angle) * r, cy + std::sin(angle) * r);
+    }
+    glEnd();
+}
+
+void drawRoundedPanel(float x1, float y1, float x2, float y2, float r) {
+    glBegin(GL_QUADS);
+    glVertex2f(x1 + r, y1);
+    glVertex2f(x2 - r, y1);
+    glVertex2f(x2 - r, y2);
+    glVertex2f(x1 + r, y2);
+
+    glVertex2f(x1, y1 + r);
+    glVertex2f(x1 + r, y1 + r);
+    glVertex2f(x1 + r, y2 - r);
+    glVertex2f(x1, y2 - r);
+
+    glVertex2f(x2 - r, y1 + r);
+    glVertex2f(x2, y1 + r);
+    glVertex2f(x2, y2 - r);
+    glVertex2f(x2 - r, y2 - r);
+    glEnd();
+
+    drawCircle(x1 + r, y1 + r, r, 20, true);
+    drawCircle(x2 - r, y1 + r, r, 20, true);
+    drawCircle(x1 + r, y2 - r, r, 20, true);
+    drawCircle(x2 - r, y2 - r, r, 20, true);
+}
+
+void drawBackground() {
+    glBegin(GL_QUADS);
+    glColor3f(0.01f, 0.01f, 0.04f);
+    glVertex2f(0, HEIGHT);
+    glVertex2f(WIDTH, HEIGHT);
+    glColor3f(0.02f, 0.04f, 0.10f);
+    glVertex2f(WIDTH, 0);
+    glVertex2f(0, 0);
+    glEnd();
+}
+
+void drawStars() {
+    glPointSize(2.0f);
+    glBegin(GL_POINTS);
+    for (const auto& s : stars) {
+        float a = 0.4f + 0.6f * std::sin(globalTimeSec * s.twinkle + s.phase);
+        glColor3f(a, a, a);
+        glVertex2f(s.x, s.y);
+    }
+    glEnd();
+}
+
+void drawRadar() {
+    glColor3f(0.03f, 0.08f, 0.10f);
+    drawRoundedPanel(20, 170, 390, 650, 18);
+
+    glColor3f(0.0f, 0.22f, 0.14f);
+    drawCircle(205, 410, 170, 100, false);
+    drawCircle(205, 410, 130, 100, false);
+    drawCircle(205, 410, 90, 100, false);
+    drawCircle(205, 410, 50, 100, false);
+
+    glBegin(GL_LINES);
+    glVertex2f(40, 410); glVertex2f(370, 410);
+    glVertex2f(205, 245); glVertex2f(205, 575);
+    glEnd();
+
+    float ang = radarSweepAngle * PI / 180.0f;
+    glColor4f(0.0f, 0.95f, 0.45f, 0.16f);
+    glBegin(GL_TRIANGLES);
+    glVertex2f(205, 410);
+    glVertex2f(205 + std::cos(ang - 0.16f) * 165.0f, 410 + std::sin(ang - 0.16f) * 165.0f);
+    glVertex2f(205 + std::cos(ang + 0.16f) * 165.0f, 410 + std::sin(ang + 0.16f) * 165.0f);
+    glEnd();
+
+    glColor3f(0.0f, 1.0f, 0.50f);
+    glBegin(GL_LINES);
+    glVertex2f(205, 410);
+    glVertex2f(205 + std::cos(ang) * 165.0f, 410 + std::sin(ang) * 165.0f);
+    glEnd();
+
+    drawText(55, 620, "RADAR / THEATER VIEW");
+}
+
+Vec2 getSatellitePos() {
+    switch (currentSatellite) {
+        case SAT_RECON: return {470.0f, 560.0f};
+        case SAT_DEFENSE: return {470.0f, 380.0f};
+        case SAT_COMMAND: return {470.0f, 210.0f};
+    }
+    return {470.0f, 380.0f};
+}
+
+void drawSatelliteBody(const Vec2& pos, SatelliteType type, bool active) {
+    float scale = satProfiles[type].bodyScale;
+    glPushMatrix();
+    glTranslatef(pos.x, pos.y, 0);
+    glScalef(scale, scale, 1.0f);
+
+    if (active) glColor3f(0.82f, 0.86f, 0.95f);
+    else glColor3f(0.45f, 0.48f, 0.58f);
+
+    glBegin(GL_QUADS);
+    glVertex2f(-20, -12);
+    glVertex2f(20, -12);
+    glVertex2f(20, 12);
+    glVertex2f(-20, 12);
+    glEnd();
+
+    if (type == SAT_RECON) glColor3f(0.22f, 0.7f, 1.0f);
+    if (type == SAT_DEFENSE) glColor3f(0.35f, 1.0f, 0.45f);
+    if (type == SAT_COMMAND) glColor3f(1.0f, 0.7f, 0.22f);
+
+    glBegin(GL_QUADS);
+    glVertex2f(-62, -8);
+    glVertex2f(-26, -8);
+    glVertex2f(-26, 8);
+    glVertex2f(-62, 8);
+
+    glVertex2f(26, -8);
+    glVertex2f(62, -8);
+    glVertex2f(62, 8);
+    glVertex2f(26, 8);
+    glEnd();
+
+    glColor3f(0.95f, 0.75f, 0.12f);
+    drawCircle(0, 0, 7, 24, true);
+
+    if (active) {
+        glColor3f(0.95f, 0.2f, 0.2f);
+        drawCircle(0, 0, 28, 36, false);
+    }
+
+    glPopMatrix();
+}
+
+void drawSatelliteDeck() {
+    glColor3f(0.03f, 0.08f, 0.12f);
+    drawRoundedPanel(410, 120, 690, 650, 18);
+    drawText(445, 620, "SATELLITE ARRAY");
+
+    drawSatelliteBody({470, 560}, SAT_RECON, currentSatellite == SAT_RECON);
+    drawText(525, 558, "1 - RECON SAT");
+    drawText(525, 538, "Khoa muc tieu nhanh");
+
+    drawSatelliteBody({470, 380}, SAT_DEFENSE, currentSatellite == SAT_DEFENSE);
+    drawText(525, 378, "2 - DEFENSE SAT");
+    drawText(525, 358, "Tac chien can bang");
+
+    drawSatelliteBody({470, 210}, SAT_COMMAND, currentSatellite == SAT_COMMAND);
+    drawText(525, 208, "3 - COMMAND SAT");
+    drawText(525, 188, "Chi huy / nang luong cao");
+}
+
+void drawTarget(const Target& t, bool selected) {
+    if (t.destroyed) {
+        glColor3f(0.35f, 0.35f, 0.40f);
+        drawCircle(t.pos.x, t.pos.y, t.radius, 36, true);
+        return;
+    }
+
+    float p = 0.5f + 0.5f * std::sin(globalTimeSec * 4.6f + t.pulse);
+    glColor3f(1.0f, 0.22f + 0.25f * p, 0.18f);
+    drawCircle(t.pos.x, t.pos.y, t.radius, 36, true);
+    glColor3f(0.12f, 0.0f, 0.0f);
+    drawCircle(t.pos.x, t.pos.y, t.radius * 0.35f, 24, true);
+
+    if (selected) {
+        glColor3f(1.0f, 0.0f, 0.0f);
+        drawCircle(t.pos.x, t.pos.y, t.radius + 12 + 4 * p, 40, false);
+        glBegin(GL_LINES);
+        glVertex2f(t.pos.x - 30, t.pos.y); glVertex2f(t.pos.x - 12, t.pos.y);
+        glVertex2f(t.pos.x + 12, t.pos.y); glVertex2f(t.pos.x + 30, t.pos.y);
+        glVertex2f(t.pos.x, t.pos.y - 30); glVertex2f(t.pos.x, t.pos.y - 12);
+        glVertex2f(t.pos.x, t.pos.y + 12); glVertex2f(t.pos.x, t.pos.y + 30);
+        glEnd();
+    }
+}
+
+void drawTargets() {
+    for (size_t i = 0; i < targets.size(); i++) {
+        drawTarget(targets[i], (int)i == selectedTarget);
+    }
+}
+
+void drawMissileTrail() {
+    for (const auto& p : trail) {
+        float r = 2.0f + p.life * 3.5f;
+        glColor3f(1.0f, 0.45f + p.life * 0.45f, 0.12f);
+        drawCircle(p.pos.x, p.pos.y, r, 20, false);
+    }
+}
+
+void drawMissile() {
+    if (!missile.active) return;
+    glPushMatrix();
+    glTranslatef(missile.pos.x, missile.pos.y, 0);
+
+    float angle = std::atan2(missile.vel.y, missile.vel.x) * 180.0f / PI;
+    glRotatef(angle, 0, 0, 1);
+
+    if (missile.type == MISSILE_INTERCEPTOR) glColor3f(0.92f, 0.95f, 1.0f);
+    if (missile.type == MISSILE_BALLISTIC)   glColor3f(1.0f, 0.84f, 0.25f);
+    if (missile.type == MISSILE_HUNTER)      glColor3f(0.45f, 1.0f, 0.55f);
+
+    glBegin(GL_TRIANGLES);
+    glVertex2f(15, 0);
+    glVertex2f(-10, 6);
+    glVertex2f(-10, -6);
+    glEnd();
+
+    glBegin(GL_QUADS);
+    glVertex2f(-3, -3);
+    glVertex2f(8, -3);
+    glVertex2f(8, 3);
+    glVertex2f(-3, 3);
+    glEnd();
+
+    glColor3f(1.0f, 0.55f, 0.08f);
+    glBegin(GL_TRIANGLES);
+    glVertex2f(-10, 0);
+    glVertex2f(-24, 5);
+    glVertex2f(-24, -5);
+    glEnd();
+
+    glPopMatrix();
+}
+
+void drawExplosion() {
+    if (!explosion.active) return;
+    float inner = explosion.radius * 0.45f;
+    glColor3f(1.0f, 0.45f, 0.0f);
+    drawCircle(explosion.pos.x, explosion.pos.y, explosion.radius, 50, false);
+    glColor3f(1.0f, 0.9f, 0.0f);
+    drawCircle(explosion.pos.x, explosion.pos.y, inner, 40, false);
+
+    glBegin(GL_LINES);
+    for (int i = 0; i < 14; i++) {
+        float a = 2.0f * PI * i / 14.0f;
+        glVertex2f(explosion.pos.x + std::cos(a) * inner, explosion.pos.y + std::sin(a) * inner);
+        glVertex2f(explosion.pos.x + std::cos(a) * explosion.radius, explosion.pos.y + std::sin(a) * explosion.radius);
+    }
+    glEnd();
+}
+
+void drawMissilePanel() {
+    glColor3f(0.03f, 0.08f, 0.12f);
+    drawRoundedPanel(715, 470, 1255, 650, 18);
+    drawText(740, 620, "MISSILE SYSTEM / TECHNICAL SPECIFICATIONS");
+
+    for (int i = 0; i < 3; i++) {
+        float y = 575 - i * 48;
+        if (currentMissile == i) glColor3f(0.12f, 0.18f, 0.28f);
+        else glColor3f(0.05f, 0.11f, 0.15f);
+        drawRoundedPanel(735, y - 18, 980, y + 18, 10);
+
+        glColor3f(0.85f, 0.95f, 1.0f);
+        std::stringstream ss;
+        ss << (i + 1) << " - " << missileProfiles[i].name;
+        drawText(750, y + 2, ss.str());
+    }
+
+    const MissileProfile& mp = missileProfiles[currentMissile];
+    glColor3f(0.85f, 0.95f, 1.0f);
+    drawText(1010, 582, "Loai dan:");
+    drawText(1105, 582, mp.name);
+    drawText(1010, 554, "Che do:");
+    drawText(1105, 554, mp.note);
+
+    std::stringstream s1, s2, s3;
+    s1 << "Toc do: " << mp.speed;
+    s2 << "Ban kinh no: " << mp.blastRadius;
+    s3 << "Turn rate: " << mp.turnRate;
+    drawText(1010, 526, s1.str());
+    drawText(1010, 498, s2.str());
+    drawText(1010, 470, s3.str());
+}
+
+void drawStatusPanel() {
+    glColor3f(0.03f, 0.08f, 0.12f);
+    drawRoundedPanel(715, 120, 1255, 445, 18);
+    drawText(740, 415, "MISSION STATUS / COMMAND PANEL");
+
+    const SatelliteProfile& sp = satProfiles[currentSatellite];
+    const MissileProfile& mp = missileProfiles[currentMissile];
+
+    glColor3f(0.84f, 0.95f, 1.0f);
+    drawText(740, 382, "Ve tinh dang chon:");
+    drawText(930, 382, sp.name);
+    drawText(740, 354, "Vai tro:");
+    drawText(930, 354, sp.role);
+
+    std::stringstream e, r, l, sc;
+    e << "Nang luong he thong: " << sp.energy;
+    r << "Tam khoa muc tieu: " << sp.lockRange;
+    l << "Thoi gian nap: " << sp.reloadTime << " s";
+    sc << "Diem tieu diet: " << score;
+    drawText(740, 326, e.str());
+    drawText(740, 298, r.str());
+    drawText(740, 270, l.str());
+    drawText(740, 242, sc.str());
+
+    int alive = 0;
+    for (const auto& t : targets) if (!t.destroyed) alive++;
+    std::stringstream a1, a2;
+    a1 << "Muc tieu con lai: " << alive;
+    a2 << "Loai dan hien tai: " << mp.name;
+    drawText(740, 214, a1.str());
+    drawText(740, 186, a2.str());
+
+    if (selectedTarget >= 0 && !targets[selectedTarget].destroyed) {
+        glColor3f(1.0f, 0.35f, 0.35f);
+        drawText(740, 158, "Target lock: ACTIVE");
+    } else {
+        glColor3f(0.75f, 0.9f, 1.0f);
+        drawText(740, 158, "Target lock: STANDBY");
+    }
+
+    if (missile.active) {
+        glColor3f(1.0f, 0.7f, 0.2f);
+        drawText(980, 158, "Missile: IN FLIGHT");
+    } else if (cooldown > 0.0f) {
+        glColor3f(1.0f, 0.7f, 0.2f);
+        drawText(980, 158, "Missile: RELOADING");
+    } else {
+        glColor3f(0.45f, 1.0f, 0.55f);
+        drawText(980, 158, "Missile: READY");
+    }
+}
+
+void drawHelpBar() {
+    glColor3f(0.04f, 0.08f, 0.13f);
+    drawRoundedPanel(20, 20, 1255, 90, 16);
+    glColor3f(0.85f, 0.95f, 1.0f);
+    drawText(40, 60, "Control: Click de chon target | Space de phong | 1/2/3 chon ve tinh | Q/W/E chon ten lua | R reset | P pause");
+    drawText(40, 35, "Missile modes: Interceptor = bay thang nhanh | Ballistic = quỹ đạo parabol | Hunter = tu dan huong thong minh");
+}
+
+void display() {
+    glClear(GL_COLOR_BUFFER_BIT);
+    drawBackground();
+    drawStars();
+    drawRadar();
+    drawSatelliteDeck();
+    drawTargets();
+    drawMissileTrail();
+    drawMissile();
+    drawExplosion();
+    drawMissilePanel();
+    drawStatusPanel();
+    drawHelpBar();
+    glutSwapBuffers();
+}
+
+void initStars() {
+    stars.clear();
+    for (int i = 0; i < 140; i++) {
+        stars.push_back({
+            randFloat(0.0f, (float)WIDTH),
+            randFloat(0.0f, (float)HEIGHT),
+            randFloat(0.0f, 6.28f),
+            randFloat(0.8f, 3.5f)
+        });
+    }
+}
+
+void resetTargets() {
+    targets.clear();
+    targets.push_back({{820, 560}, {820, 560}, 24, 0.2f, 0.2f, false});
+    targets.push_back({{1120, 520}, {1120, 520}, 22, 1.1f, 1.0f, false});
+    targets.push_back({{980, 340}, {980, 340}, 20, 2.4f, 2.2f, false});
+    targets.push_back({{820, 200}, {820, 200}, 26, 3.0f, 0.8f, false});
+    targets.push_back({{1110, 220}, {1110, 220}, 18, 4.0f, 1.7f, false});
+}
+
+void resetGame() {
+    resetTargets();
+    missile = Missile();
+    explosion = Explosion();
+    trail.clear();
+    selectedTarget = -1;
+    paused = false;
+    score = 0;
+    cooldown = 0.0f;
+}
+
+bool targetInRange(int idx) {
+    if (idx < 0 || idx >= (int)targets.size()) return false;
+    Vec2 satPos = getSatellitePos();
+    return distance2D(satPos, targets[idx].pos) <= satProfiles[currentSatellite].lockRange;
+}
+
+void launchMissile() {
+    if (selectedTarget < 0) return;
+    if (targets[selectedTarget].destroyed) return;
+    if (missile.active) return;
+    if (cooldown > 0.0f) return;
+    if (!targetInRange(selectedTarget)) return;
+
+    Vec2 satPos = getSatellitePos();
+    const MissileProfile& mp = missileProfiles[currentMissile];
+
+    missile.active = true;
+    missile.type = currentMissile;
+    missile.pos = satPos;
+    missile.startPos = satPos;
+    missile.targetSnapshot = targets[selectedTarget].pos;
+    missile.radius = 6.0f;
+    missile.age = 0.0f;
+    missile.life = 0.0f;
+
+    Vec2 dir = normalize(missile.targetSnapshot - satPos);
+    missile.vel = dir * mp.speed;
+
+    if (mp.guidance == GUIDE_PARABOLIC) {
+        float dx = missile.targetSnapshot.x - satPos.x;
+        float dy = missile.targetSnapshot.y - satPos.y;
+        float flightTime = std::max(0.8f, std::fabs(dx) / std::max(1.0f, mp.speed * 55.0f));
+        missile.vel.x = dx / (flightTime * 60.0f);
+        missile.vel.y = (dy / (flightTime * 60.0f)) + mp.gravity * flightTime * 30.0f;
+    }
+
+    trail.clear();
+    cooldown = satProfiles[currentSatellite].reloadTime;
+}
+
+void updateTargets(float dt) {
+    for (size_t i = 0; i < targets.size(); i++) {
+        if (targets[i].destroyed) continue;
+        float ampX = 22.0f + i * 5.0f;
+        float ampY = 15.0f + i * 4.0f;
+        targets[i].pos.x = targets[i].basePos.x + std::cos(globalTimeSec * 0.85f + targets[i].phase) * ampX;
+        targets[i].pos.y = targets[i].basePos.y + std::sin(globalTimeSec * 1.15f + targets[i].phase) * ampY;
+    }
+}
+
+void updateTrail(float dt) {
+    for (auto& p : trail) p.life -= dt * 1.5f;
+    trail.erase(std::remove_if(trail.begin(), trail.end(), [](const TrailPoint& p) {
+        return p.life <= 0.0f;
+    }), trail.end());
+}
+
+void explodeAt(const Vec2& pos, float radiusBonus) {
+    explosion.active = true;
+    explosion.pos = pos;
+    explosion.radius = 12.0f + radiusBonus * 0.15f;
+    explosion.life = 26;
+}
+
+void checkHit() {
+    if (!missile.active) return;
+    const MissileProfile& mp = missileProfiles[missile.type];
+
+    for (size_t i = 0; i < targets.size(); i++) {
+        if (targets[i].destroyed) continue;
+        float d = distance2D(missile.pos, targets[i].pos);
+        if (d <= targets[i].radius + mp.blastRadius * 0.35f) {
+            explodeAt(targets[i].pos, mp.blastRadius);
+
+            for (auto& t : targets) {
+                if (!t.destroyed && distance2D(t.pos, targets[i].pos) <= mp.blastRadius) {
+                    t.destroyed = true;
+                    score += 10;
+                }
+            }
+
+            missile.active = false;
+            selectedTarget = -1;
+            return;
+        }
+    }
+}
+
+void updateMissile(float dt) {
+    if (!missile.active) return;
+
+    missile.age += dt;
+    missile.life += dt;
+    const MissileProfile& mp = missileProfiles[missile.type];
+
+    if (mp.guidance == GUIDE_DIRECT) {
+        missile.pos = missile.pos + missile.vel;
+    }
+    else if (mp.guidance == GUIDE_PARABOLIC) {
+        missile.vel.y -= mp.gravity;
+        missile.pos = missile.pos + missile.vel;
+    }
+    else if (mp.guidance == GUIDE_HOMING) {
+        Vec2 targetPos = missile.targetSnapshot;
+        if (selectedTarget >= 0 && !targets[selectedTarget].destroyed) {
+            targetPos = targets[selectedTarget].pos;
+        } else {
+            float best = 1e9f;
+            for (const auto& t : targets) {
+                if (t.destroyed) continue;
+                float d = distance2D(missile.pos, t.pos);
+                if (d < best) {
+                    best = d;
+                    targetPos = t.pos;
+                }
+            }
+        }
+
+        Vec2 desired = normalize(targetPos - missile.pos);
+        Vec2 cur = normalize(missile.vel);
+        Vec2 blended = normalize(cur * (1.0f - mp.turnRate) + desired * mp.turnRate);
+        missile.vel = blended * mp.speed;
+        missile.pos = missile.pos + missile.vel;
+    }
+
+    trail.push_back({missile.pos, 1.0f});
+    if (trail.size() > 34) trail.erase(trail.begin());
+
+    checkHit();
+
+    if (missile.pos.x < -50 || missile.pos.x > WIDTH + 50 || missile.pos.y < -50 || missile.pos.y > HEIGHT + 50) {
+        missile.active = false;
+    }
+    if (missile.life > 8.0f) {
+        missile.active = false;
+    }
+}
+
+void updateExplosion() {
+    if (!explosion.active) return;
+    explosion.radius += 4.2f;
+    explosion.life--;
+    if (explosion.life <= 0) {
+        explosion.active = false;
+        explosion.radius = 0.0f;
+    }
+}
+
+void timer(int value) {
+    const float dt = 0.016f;
+    if (!paused) {
+        globalTimeSec += dt;
+        radarSweepAngle += 2.4f;
+        if (radarSweepAngle > 360.0f) radarSweepAngle -= 360.0f;
+        updateTargets(dt);
+        updateMissile(dt);
+        updateExplosion();
+        updateTrail(dt);
+        if (cooldown > 0.0f) cooldown = std::max(0.0f, cooldown - dt);
+    }
+
+    glutPostRedisplay();
+    glutTimerFunc(16, timer, 0);
+}
+
+void mouse(int button, int state, int x, int y) {
+    if (button != GLUT_LEFT_BUTTON || state != GLUT_DOWN) return;
+    float mx = (float)x;
+    float my = (float)(HEIGHT - y);
+
+    selectedTarget = -1;
+    for (size_t i = 0; i < targets.size(); i++) {
+        if (targets[i].destroyed) continue;
+        if (distance2D({mx, my}, targets[i].pos) <= targets[i].radius + 10.0f) {
+            selectedTarget = (int)i;
+            break;
+        }
+    }
+
+    glutPostRedisplay();
+}
+
+void keyboard(unsigned char key, int, int) {
+    switch (key) {
+        case '1': currentSatellite = SAT_RECON; break;
+        case '2': currentSatellite = SAT_DEFENSE; break;
+        case '3': currentSatellite = SAT_COMMAND; break;
+
+        case 'q': case 'Q': currentMissile = MISSILE_INTERCEPTOR; break;
+        case 'w': case 'W': currentMissile = MISSILE_BALLISTIC; break;
+        case 'e': case 'E': currentMissile = MISSILE_HUNTER; break;
+
+        case 32: launchMissile(); break;
+        case 'r': case 'R': resetGame(); break;
+        case 'p': case 'P': paused = !paused; break;
+        case 27: std::exit(0); break;
+    }
+}
+
+void init() {
+    std::srand((unsigned)std::time(nullptr));
+    glClearColor(0.02f, 0.02f, 0.05f, 1.0f);
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    gluOrtho2D(0, WIDTH, 0, HEIGHT);
+
+    initStars();
+    resetGame();
+}
+
+int main(int argc, char** argv) {
+    glutInit(&argc, argv);
+    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB);
+    glutInitWindowSize(WIDTH, HEIGHT);
+    glutInitWindowPosition(40, 20);
+    glutCreateWindow("Mo phong he thong tac chien ve tinh 2D - Professional Simulation");
+
+    init();
+    glutDisplayFunc(display);
+    glutKeyboardFunc(keyboard);
+    glutMouseFunc(mouse);
+    glutTimerFunc(16, timer, 0);
+    glutMainLoop();
+    return 0;
+}
